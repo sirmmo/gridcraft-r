@@ -1,0 +1,225 @@
+{
+  "id": "io.github.sirmmo.r",
+  "name": "GridCraft R",
+  "version": "0.1.0",
+  "description": "R in GridCraft: R code in formulas, ready-made statistics (linear models, t-tests, quantiles, correlations, summaries), R scripts, plots and a console. Needs R 3.4 or later (Rscript on PATH); no packages.",
+  "author": "Marco Montanari",
+  "homepage": "https://github.com/sirmmo/gridcraft-r",
+  "apps": [
+    "gridcraft"
+  ],
+  "run": {
+    "command": "Rscript",
+    "args": [
+      "--vanilla",
+      "main.R"
+    ]
+  },
+  "requires": {
+    "apps": {
+      "gridcraft": ">=0.7.0"
+    },
+    "protocol": ">=1.2",
+    "features": [
+      "dialogs",
+      "document"
+    ]
+  },
+  "events": [
+    "documentOpened",
+    "documentSaved",
+    "documentClosed"
+  ],
+  "functions": [
+    {
+      "name": "R.EVAL",
+      "signature": "R.EVAL(code, [x], [y], [z], ...)",
+      "description": "Runs R code with the arguments as x, y, z (all of them: args, ..1, ..2...). A range is a matrix. Trusted workbooks only",
+      "minArgs": 1,
+      "maxArgs": 255,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "R.CALL",
+      "signature": "R.CALL(function, [arg1], [arg2], ...)",
+      "description": "Calls an R function by name (\"median\", \"stats::mad\") with the arguments. Trusted workbooks only",
+      "minArgs": 1,
+      "maxArgs": 255,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "R.LM",
+      "signature": "R.LM(known_y, known_x, [const])",
+      "description": "Linear model y ~ x (one or more columns of x): a spilled table of coefficients, std. errors, t and p values, R squared, F",
+      "minArgs": 2,
+      "maxArgs": 3,
+      "timeoutMs": 10000
+    },
+    {
+      "name": "R.QUANTILE",
+      "signature": "R.QUANTILE(values, [probabilities], [type])",
+      "description": "Quantiles with R's nine definitions (type 1-9, default 7). One probability gives a number, several a spilled table (default: 0, 0.25, 0.5, 0.75, 1)",
+      "minArgs": 1,
+      "maxArgs": 3,
+      "timeoutMs": 10000
+    },
+    {
+      "name": "R.CORR",
+      "signature": "R.CORR(values, [method], [headers])",
+      "description": "Correlation matrix of the columns, with labels: method \"pearson\" (default), \"spearman\" or \"kendall\"; headers TRUE takes the names from the first row",
+      "minArgs": 1,
+      "maxArgs": 3,
+      "timeoutMs": 10000
+    },
+    {
+      "name": "R.TTEST",
+      "signature": "R.TTEST(x, [y], [paired], [mu], [alternative])",
+      "description": "Student's t-test (Welch for two samples): a spilled table of t, df, p value, 95% confidence interval and means",
+      "minArgs": 1,
+      "maxArgs": 5,
+      "timeoutMs": 10000
+    },
+    {
+      "name": "R.SUMMARY",
+      "signature": "R.SUMMARY(values, [headers])",
+      "description": "Per-column summary like R's summary(): n, missing, min, quartiles, median, mean, max, std. dev. (spills)",
+      "minArgs": 1,
+      "maxArgs": 2,
+      "timeoutMs": 10000
+    },
+    {
+      "name": "R.VERSION",
+      "signature": "R.VERSION()",
+      "description": "The add-in and R versions",
+      "minArgs": 0,
+      "maxArgs": 0
+    }
+  ],
+  "commands": [
+    {
+      "id": "runScript",
+      "label": "Run R Script",
+      "description": "Runs R code on the selection (x) and writes the result below it or on a new sheet",
+      "params": "{code? | file?, header?: bool, output?: below|sheet} (no params: asks)"
+    },
+    {
+      "id": "plot",
+      "label": "R Plot",
+      "description": "Draws a base R plot of the selection (x) and inserts it as a picture",
+      "params": "{code?, header?: bool, width?, height?} (no params: asks)"
+    },
+    {
+      "id": "console",
+      "label": "R Console",
+      "description": "Evaluates R code in R's workspace and shows the result",
+      "params": "{code?} (no params: asks)"
+    },
+    {
+      "id": "trust",
+      "label": "Trust This Workbook",
+      "description": "Turns R code on for the active workbook, after spelling out the risk"
+    },
+    {
+      "id": "trustConfirm",
+      "label": "Trust This Workbook (confirmed)",
+      "description": "Trusts the active workbook without asking (what Trust This Workbook's OK runs)",
+      "params": "{path, name}: the active workbook's, as a check"
+    },
+    {
+      "id": "untrust",
+      "label": "Stop Trusting",
+      "description": "Turns R code off for the active workbook"
+    },
+    {
+      "id": "trusted",
+      "label": "Trusted Workbooks",
+      "description": "Lists the trusted workbooks, to take some off the list"
+    },
+    {
+      "id": "untrustPaths",
+      "label": "Remove Trusted Workbooks",
+      "description": "Takes workbooks off the trusted list",
+      "params": "{ids: [path, ...]}"
+    },
+    {
+      "id": "about",
+      "label": "About R",
+      "description": "R version, R_HOME, installed packages and whether R is on for this workbook"
+    }
+  ],
+  "ui": {
+    "ribbon": [
+      {
+        "tab": "R",
+        "group": "Code",
+        "buttons": [
+          {
+            "command": "runScript",
+            "label": "Run Script…",
+            "icon": "script"
+          },
+          {
+            "command": "console",
+            "label": "Console…",
+            "icon": "calc"
+          }
+        ]
+      },
+      {
+        "tab": "R",
+        "group": "Charts",
+        "buttons": [
+          {
+            "command": "plot",
+            "label": "Plot…",
+            "icon": "chartLine"
+          }
+        ]
+      },
+      {
+        "tab": "R",
+        "group": "Trust",
+        "buttons": [
+          {
+            "command": "trust",
+            "label": "Trust This Workbook",
+            "icon": "lock"
+          },
+          {
+            "command": "untrust",
+            "size": "small",
+            "icon": "lock"
+          },
+          {
+            "command": "trusted",
+            "label": "Trusted Workbooks…",
+            "size": "small",
+            "icon": "settings"
+          }
+        ]
+      },
+      {
+        "tab": "R",
+        "group": "About",
+        "buttons": [
+          {
+            "command": "about",
+            "icon": "info"
+          }
+        ]
+      }
+    ],
+    "menus": [
+      {
+        "menu": "cell",
+        "command": "runScript",
+        "label": "Run R Script…"
+      },
+      {
+        "menu": "cell",
+        "command": "plot",
+        "label": "R Plot…"
+      }
+    ]
+  }
+}

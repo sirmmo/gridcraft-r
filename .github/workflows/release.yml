@@ -1,0 +1,43 @@
+# Attaches gridcraft-r-<version>.zip to the release of the pushed tag (v1.2.3). The zip names no
+# platform, so GridCraft's installer picks it on every platform (docs/plugins.md, "Publishing a
+# plugin on GitHub"); R scripts need no build.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: r-lib/actions/setup-r@f9a764fea8d5c63df6ef9a5c7795bf7deb5d7e05 # v2.14.0
+        with:
+          r-version: release
+      - name: Tests
+        run: Rscript --vanilla tests/run.R
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          manifest=$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')
+          if [ "$manifest" != "$version" ]; then
+            echo "plugin.json says $manifest, the tag $TAG" >&2
+            exit 1
+          fi
+          mkdir -p dist/gridcraft-r
+          cp plugin.json main.R gridcraft_r.R README.md LICENSE dist/gridcraft-r/
+          (cd dist && zip -qr "gridcraft-r-$version.zip" gridcraft-r)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "GridCraft R $TAG" --generate-notes
+          gh release upload "$TAG" dist/gridcraft-r-*.zip --repo "$GITHUB_REPOSITORY" --clobber
