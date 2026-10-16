@@ -207,7 +207,7 @@ s <- session(c(
   fcall(22, "R.EVAL", "[\"cat('noise'); print(1:3); message('note'); warning('careful'); 7\"]"),
   fcall(23, "R.EVAL", "[\"sink(tempfile()); 8\"]"),
   fcall(24, "R.EVAL", "[\"quit('no')\"]"),
-  fcall(25, "R.EVAL", "[\"Sys.sleep(10)\"]"),
+  fcall(25, "R.EVAL", "[\"x <- 0; repeat { x <- x + 1 }\"]"),
   fcall(26, "R.EVAL", "[\"1:2e6\"]"),
   fcall(27, "R.EVAL", "[\"x[2,1]\",[[\"a\",null],[true,5]]]"),
   fcall(28, "R.EVAL", "[\"(\"]"),
@@ -257,7 +257,7 @@ same("printed output stays out of the protocol", value(s, 22), 7)
 check("output went to the log", any(grepl("noise", s$log)) && any(grepl("careful", s$log)))
 same("a sink left open", value(s, 23), 8)
 check("quit is refused", grepl("quit() is turned off", err_msg(s, 24), fixed = TRUE))
-check("time limit", grepl("too long", err_msg(s, 25)))
+msg25 <- err_msg(s, 25); check("time limit", grepl("too long", msg25)); if (!grepl("too long", msg25)) cat("  time limit message was:", msg25, "\n")
 same("result too big", value(s, 26), list(error = "#NUM!"))
 same("mixed range is character", value(s, 27), "TRUE")
 check("syntax error", grepl("can't read the code", err_msg(s, 28)))
