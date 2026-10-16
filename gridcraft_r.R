@@ -12,7 +12,7 @@
 
 .gridcraft_r <- local({
 
-PLUGIN_VERSION <- "0.1.0"
+PLUGIN_VERSION <- "0.2.0"
 PLUGIN_ID <- "io.github.sirmmo.r"
 
 # Limits. GridCraft sends at most 1,000,000 cells a call and takes as many back.
@@ -39,11 +39,28 @@ host$id <- "gridcraft"
 host$features <- character(0)
 host$version <- ""
 
-# The workbook GridCraft is working on, as far as we know (see "Trust" below).
+# The workbook GridCraft is working on, as far as we know (see "Trust" below): what older
+# GridCraft versions leave us to go by.
 active <- new.env()
 active$known <- FALSE
 active$path <- NA_character_
 active$name <- NA_character_
+
+# The workbook whose formula is being calculated (functions/call's `document`, GridCraft 2.2).
+calling <- new.env()
+calling$has <- FALSE
+calling$path <- NA_character_
+calling$name <- NA_character_
+calling$id <- NA_character_
+
+# The workbooks GridCraft told us about by session id (protocol 2.2): id -> list(path, name).
+docs <- new.env()
+
+# The connection to GridCraft (standard input), for asking it things while we answer.
+io <- new.env()
+io$con <- NULL
+io$queue <- character(0) # messages that arrived while we waited for an answer
+io$next_id <- 0L
 
 # Text typed in the dialogs, offered again next time.
 last <- new.env()
@@ -660,8 +677,13 @@ grid_matrix <- function(g) {
 
 # --- R values to cells -----------------------------------------------------------------------
 
-# JSON cells for a vector. `quote_text`: commands write values as typed input, so text gets a
-# leading apostrophe to stay text (dates don't: they become dates).
+# Marks a date cell in "literal" mode (see write_commands); never the start of real JSON.
+DATE_MARK <- "\001"
+
+# JSON cells for a vector. `quote_text`: TRUE: commands write values as typed input, so text gets
+# a leading apostrophe to stay text (dates don't: they become dates). "literal": GridCraft writes
+# text as text (range.setValues literal, protocol 2.2); date cells are marked with DATE_MARK, to be
+# written as typed input.
 cell_json <- function(x, quote_text = FALSE) {
   date_text <- FALSE
   if (is.factor(x)) {
@@ -685,8 +707,10 @@ cell_json <- function(x, quote_text = FALSE) {
     len <- nchar(x, type = "chars", allowNA = TRUE)
     long <- !na & !is.na(len) & len > MAX_TEXT
     if (any(long)) x[long] <- substr(x[long], 1L, MAX_TEXT)
-    if (quote_text && !date_text) x[!na] <- paste0("'", x[!na])
-    return(json_str(x))
+    if (isTRUE(quote_text) && !date_text) x[!na] <- paste0("'", x[!na])
+    out <- json_str(x)
+    if (identical(quote_text, "literal") && date_text) out[!na] <- paste0(DATE_MARK, out[!na])
+    return(out)
   }
   if (is.logical(x)) return(ifelse(is.na(x), "null", ifelse(x, "true", "false")))
   if (is.numeric(x)) {
@@ -758,9 +782,10 @@ value_cells <- function(v, quote_text = FALSE) {
 }
 
 # A matrix of JSON cells as a function's value: one cell alone, else rows.
-# GridCraft shows a null in a formula's result as 0, so empty cells (NA) are empty text here.
+# GridCraft shows a null in a formula's result as 0 (as Excel does), so empty cells (NA, NULL) are
+# its explicit blank where it has one (protocol 2.2's emptyResult), else empty text.
 cells_value <- function(m) {
-  m[m == "null"] <- "\"\""
+  m[m == "null"] <- if (has_feature("emptyResult")) "{\"empty\":true}" else "\"\""
   if (nrow(m) == 1L && ncol(m) == 1L) return(m[1L, 1L])
   cells_rows(m)
 }
@@ -858,7 +883,8 @@ code_function <- function(exprs, argv) {
 trust <- new.env()
 trust$paths <- character(0)
 trust$mtime <- NA
-trust$session <- character(0) # names of unsaved workbooks trusted for this session
+trust$session <- character(0) # names of unsaved workbooks trusted for this session (older hosts)
+trust$ids <- character(0)     # unsaved workbooks trusted for this session: names, by session id
 
 data_dir <- function() {
   d <- Sys.getenv("GRIDCRAFT_R_DATA")
@@ -929,22 +955,36 @@ trust_all <- function() identical(tolower(Sys.getenv("GRIDCRAFT_R_TRUST")), "all
 
 is_new_book <- function(name) !is.na(name) && grepl("^Book[0-9]+$", name)
 
-doc_trusted <- function(path, name) {
+# A workbook is trusted by its file; one without a file by its session id (GridCraft 2.2) or,
+# on older hosts, its name. A new BookN that was never saved is trusted: its formulas are yours.
+doc_trusted <- function(path, name, id = NA_character_) {
   if (trust_all()) return(TRUE)
   if (!is.na(path)) {
     trust_load()
     return(norm_path(path) %in% trust$paths)
   }
+  if (!is.na(id)) return(is_new_book(name) || id %in% names(trust$ids))
   !is.na(name) && (is_new_book(name) || name %in% trust$session)
+}
+
+# A `document` object (context.document, functions/call, the events) as list(path, name, id).
+doc_of <- function(d, fallback_name = NULL) {
+  path <- jstring(jget(d, "path")) %||% NA_character_
+  name <- jstring(jget(d, "name")) %||% fallback_name %||% (if (is.na(path)) NA_character_ else basename(path))
+  id <- jstring(jget(d, "id")) %||% NA_character_
+  list(path = path, name = name, id = id)
+}
+
+# Remembers what GridCraft said about a workbook with a session id.
+note_doc <- function(doc) {
+  if (!is.na(doc$id)) assign(doc$id, list(path = doc$path, name = doc$name), envir = docs)
 }
 
 # The workbook a command runs in, from context.document (NULL: the host didn't say).
 context_doc <- function(ctx) {
   d <- jget(ctx, "document")
   if (!is.list(d)) return(NULL)
-  path <- jstring(jget(d, "path")) %||% NA_character_
-  name <- jstring(jget(d, "name")) %||% jstring(jget(ctx, "workbook")) %||% NA_character_
-  list(path = path, name = name)
+  doc_of(d, jstring(jget(ctx, "workbook")))
 }
 
 set_active <- function(path, name) {
@@ -953,8 +993,20 @@ set_active <- function(path, name) {
   active$name <- name
 }
 
+# R code in a formula runs when the formula's own workbook is trusted (GridCraft 2.2 says which
+# one it is); older hosts leave us the workbook we last heard of.
 functions_trusted <- function() {
-  trust_all() || (active$known && doc_trusted(active$path, active$name))
+  if (trust_all()) return(TRUE)
+  if (has_feature("functionDocument")) return(calling$has && doc_trusted(calling$path, calling$name, calling$id))
+  active$known && doc_trusted(active$path, active$name)
+}
+
+# Which workbook the log should name when R is off.
+off_where <- function() {
+  if (has_feature("functionDocument")) {
+    return(if (calling$has) paste0(" (", calling$path %|na|% calling$name, ")") else " (no workbook)")
+  }
+  if (active$known) paste0(" (", active$path %|na|% active$name, ")") else " (no workbook known yet)"
 }
 
 OFF_MESSAGE <- "R is turned off for this workbook: R > Trust This Workbook"
@@ -1042,7 +1094,7 @@ user_value <- function(f) {
 
 require_trust <- function() {
   if (!functions_trusted()) {
-    log_msg(OFF_MESSAGE, if (active$known) paste0(" (", active$path %|na|% active$name, ")") else " (no workbook known yet)")
+    log_msg(OFF_MESSAGE, off_where())
     plugin_error(OFF_MESSAGE)
   }
 }
@@ -1228,6 +1280,13 @@ call_function <- function(params) {
   name <- toupper(jstring(jget(params, "name")) %||% "")
   if (!(name %in% names(FUNCTIONS))) return(rpc_error(-32601L, paste("unknown function", name)))
   fn <- FUNCTIONS[[name]]
+  d <- jget(params, "document")
+  calling$has <- is.list(d) && !is.null(names(d))
+  doc <- if (calling$has) doc_of(d) else list(path = NA_character_, name = NA_character_, id = NA_character_)
+  calling$path <- doc$path
+  calling$name <- doc$name
+  calling$id <- doc$id
+  if (calling$has) note_doc(doc)
   args <- call_args(jget(params, "args"))
   total <- sum(vapply(args, arg_count, 1))
   if (total > MAX_CELLS) return(json_raw(paste0("{\"value\":", ERR_VALUE, "}")))
@@ -1313,7 +1372,7 @@ check_command_trust <- function(ctx) {
   if (is.null(doc)) {
     plugin_error("This GridCraft doesn't say which workbook is open, so R can't check that it's trusted. Update GridCraft (0.7 or later).")
   }
-  if (doc_trusted(doc$path, doc$name)) return(NULL)
+  if (doc_trusted(doc$path, doc$name, doc$id)) return(NULL)
   text <- paste0("R is turned off for ", doc$name %|na|% "this workbook", ": its R code could run on your computer. ",
                  "Trust the workbook first (R > Trust This Workbook).")
   if (has_feature("dialogs")) {
@@ -1331,10 +1390,22 @@ values_x <- function(ctx, header) {
 
 elapsed_text <- function(t0) sprintf("%.2f s", as.numeric(proc.time()[["elapsed"]] - t0))
 
-# The commands that write `cells` (a matrix of JSON cells) where `where` says.
-write_commands <- function(cells, where, ctx, bold_header) {
+# The commands that write `cells` (a matrix of JSON cells) where `where` says. `literal`: the cells
+# come from cell_json's "literal" mode: text is written as text (range.setValues literal), and the
+# date cells (marked) are written again as typed input, so they become dates.
+write_commands <- function(cells, where, ctx, bold_header, literal = FALSE) {
   nr <- nrow(cells); nc <- ncol(cells)
+  dates <- matrix(FALSE, nr, nc)
+  if (literal) {
+    dates <- matrix(startsWith(cells, DATE_MARK), nr, nc)
+    cells[dates] <- substring(cells[dates], 2L)
+  }
   values <- json_raw(cells_rows(cells))
+  set_values <- function(range) {
+    p <- list(range = range, values = values)
+    if (literal) p$literal <- TRUE
+    list(command = "range.setValues", params = p)
+  }
   sel <- parse_range(jstring(jget(ctx, "selection"))) %||% parse_range(jstring(jget(ctx, "active")))
   if (identical(where, "sheet") || is.null(sel)) {
     taken <- vapply(jget(ctx, "sheets") %||% list(), function(s) jstring(jget(s, "name")) %||% "", "")
@@ -1344,17 +1415,26 @@ write_commands <- function(cells, where, ctx, bold_header) {
       i <- i + 1L
       name <- paste("R Output", i)
     }
-    cmds <- list(list(command = "home.insertSheet", params = list(name = name)),
-                 list(command = "range.setValues", params = list(range = "A1", values = values)))
+    cmds <- list(list(command = "home.insertSheet", params = list(name = name)), set_values("A1"))
     at <- paste0("'", name, "'!A1")
     first <- list(c1 = 1, r1 = 1)
   } else {
     first <- list(c1 = sel$c1, r1 = sel$r2 + 2)
     at <- paste0(col_letters(first$c1), first$r1)
-    cmds <- list(list(command = "range.setValues", params = list(range = at, values = values)))
+    cmds <- list(set_values(at))
   }
   if (first$r1 + nr - 1 > MAX_ROWS || first$c1 + nc - 1 > MAX_COLS) {
     plugin_error(sprintf("The result (%d x %d) doesn't fit on the sheet from %s.", nr, nc, at))
+  }
+  for (j in which(colSums(dates) > 0)) {
+    runs <- rle(dates[, j])
+    ends <- cumsum(runs$lengths)
+    for (k in which(runs$values)) {
+      i2 <- ends[k]; i1 <- i2 - runs$lengths[k] + 1L
+      cmds[[length(cmds) + 1L]] <- list(command = "range.setValues", params = list(
+        range = paste0(col_letters(first$c1 + j - 1), first$r1 + i1 - 1),
+        values = json_raw(cells_rows(cells[i1:i2, j, drop = FALSE]))))
+    }
   }
   if (bold_header) {
     hdr <- paste0(col_letters(first$c1), first$r1, ":", col_letters(first$c1 + nc - 1), first$r1)
@@ -1367,9 +1447,10 @@ script_form <- function() {
   list(dialog = list(
     title = "Run R Script",
     kind = "form",
-    prompt = "x holds the selection's values. The value of the last expression is written to the sheet. Separate statements with ;",
+    prompt = paste0("x holds the selection's values. The value of the last expression is written to the sheet.",
+                    if (has_feature("multiline")) "" else " Separate statements with ;"),
     fields = list(
-      list(id = "code", label = "R code", value = last$script, multiline = TRUE),
+      list(id = "code", label = "R code", value = last$script, multiline = TRUE, code = TRUE, rows = 12L),
       list(id = "file", label = "...or an R file to run", value = ""),
       list(id = "header", label = "The first row holds column names (x is a data frame)", kind = "checkbox", value = FALSE),
       list(id = "output", label = "Write the result", kind = "choice", value = "below",
@@ -1414,9 +1495,10 @@ cmd_run_script <- function(params, ctx) {
   if (is.null(res$value) || (!res$visible && is.null(res$value))) {
     out$message <- paste0("R ran in ", took, " (no result to write)")
   } else {
-    cells <- tryCatch(value_cells(res$value, quote_text = TRUE),
+    literal <- has_feature("literalValues")
+    cells <- tryCatch(value_cells(res$value, quote_text = if (literal) "literal" else TRUE),
                       cell_error = function(e) plugin_error("The result is too big for the sheet (at most 1,000,000 cells)."))
-    w <- write_commands(cells, where, ctx, is.data.frame(res$value))
+    w <- write_commands(cells, where, ctx, is.data.frame(res$value), literal)
     out$commands <- w$commands
     out$message <- sprintf("R ran in %s and wrote %d x %d cells at %s", took, nrow(cells), ncol(cells), w$at)
   }
@@ -1467,7 +1549,7 @@ plot_form <- function() {
     kind = "form",
     prompt = "Base R graphics; x holds the selection's values. The picture goes next to the selection.",
     fields = list(
-      list(id = "code", label = "R plotting code", value = last$plot, multiline = TRUE),
+      list(id = "code", label = "R plotting code", value = last$plot, multiline = TRUE, code = TRUE, rows = 8L),
       list(id = "header", label = "The first row holds column names (x is a data frame)", kind = "checkbox", value = FALSE),
       list(id = "width", label = "Width (pixels)", kind = "number", value = 640),
       list(id = "height", label = "Height (pixels)", kind = "number", value = 480)),
@@ -1520,7 +1602,7 @@ console_form <- function() {
     title = "R Console",
     kind = "form",
     prompt = "Runs in R's workspace: what you define stays for R.EVAL, R.CALL and the next run. x holds the selection's values.",
-    fields = list(list(id = "code", label = "R", value = last$console, multiline = TRUE)),
+    fields = list(list(id = "code", label = "R", value = last$console, multiline = TRUE, code = TRUE, rows = 6L)),
     command = "console",
     okLabel = "Run"))
 }
@@ -1591,23 +1673,69 @@ RISK <- paste0(
   "start programs. A workbook made by someone else can carry such formulas.\n\n",
   "Trust a workbook only if you made it, or you trust whoever did and know what its R code does.")
 
+# Asks GridCraft something while we answer it (protocol 1.1 host requests; protocol 2.2's
+# host/functions/invalidate also any time): sends the request and reads standard input until its
+# answer comes. Other messages that arrive meanwhile are kept for the main loop. NULL when there's
+# no GridCraft to ask (tests calling the functions directly) or it went away.
+host_request <- function(method, params) {
+  if (is.null(io$con)) return(NULL)
+  io$next_id <- io$next_id + 1L
+  id <- paste0("r", io$next_id)
+  send(paste0("{\"jsonrpc\":\"2.0\",\"id\":", json_str(id), ",\"method\":", json_str(method), ",\"params\":", to_json(params), "}"))
+  repeat {
+    line <- tryCatch(readLines(io$con, n = 1L, warn = FALSE, encoding = "UTF-8", skipNul = TRUE),
+                     error = function(e) character(0))
+    if (length(line) == 0L) return(NULL)
+    if (!grepl("[^ \t\r]", line, useBytes = TRUE)) next
+    msg <- if (nchar(line, type = "bytes") > MAX_LINE) NULL else tryCatch(json_parse(line), error = function(e) NULL)
+    if (is.list(msg) && !is.null(names(msg)) && is.null(jget(msg, "method")) && identical(jstring(jget(msg, "id")), id)) {
+      return(msg)
+    }
+    # A request or notification of GridCraft's: the main loop handles it after this answer.
+    if (is.list(msg) && !is.null(jget(msg, "method"))) io$queue <- c(io$queue, line)
+  }
+}
+
+# The functions whose results depend on trust.
+CODE_FUNCTIONS <- c("R.EVAL", "R.CALL")
+
+# Trust changed: GridCraft forgets R.EVAL's and R.CALL's results and recalculates the formulas
+# that use them (protocol 2.2). TRUE when it did; older hosts recalculate with Calculate Now.
+invalidate_code <- function() {
+  if (!has_feature("invalidate")) return(FALSE)
+  a <- host_request("host/functions/invalidate", list(names = I(CODE_FUNCTIONS)))
+  ok <- is.list(a) && !is.null(jget(a, "result"))
+  if (!ok) log_msg("GridCraft didn't recalculate the R formulas: ", jstring(jget(jget(a, "error"), "message")) %||% "no answer")
+  ok
+}
+
+CALC_NOW <- list(command = "formulas.calculateNow", params = structure(list(), names = character(0)))
+
+# A result that brings the R formulas up to date after trust changed.
+recalculated <- function(out) {
+  if (!invalidate_code()) out$commands <- list(CALC_NOW)
+  out
+}
+
 cmd_trust <- function(params, ctx) {
   doc <- need_doc(ctx)
   label <- doc$name %|na|% "this workbook"
-  if (doc_trusted(doc$path, doc$name)) {
+  if (doc_trusted(doc$path, doc$name, doc$id)) {
     text <- if (is.na(doc$path) && is_new_book(doc$name)) {
-      paste0(label, " is new and unsaved: R works in it until you save it. Then trust the saved file.")
+      paste0(label, " is new and unsaved: R works in it", if (is.na(doc$id)) " until you save it. Then trust the saved file." else ", and stays on in the file you save it to.")
     } else {
       paste0("R is already on for ", label, ".")
     }
-    return(list(message = text, commands = list(list(command = "formulas.calculateNow", params = structure(list(), names = character(0))))))
+    return(recalculated(list(message = text)))
   }
   where <- if (is.na(doc$path)) {
-    paste0("\n\n", label, " isn't saved: it will be trusted until GridCraft closes.")
+    paste0("\n\n", label, " isn't saved: it will be trusted until GridCraft closes",
+           if (is.na(doc$id)) "." else ", and so will the file you save it to.")
   } else {
     paste0("\n\nThe workbook: ", doc$path)
   }
   confirm <- list(path = doc$path, name = doc$name)
+  if (!is.na(doc$id)) confirm$id <- doc$id
   if (!has_feature("dialogs")) return(cmd_trust_confirm(confirm, ctx))
   list(dialog = message_dialog(paste0("Trust ", label, "?"), paste0(RISK, where),
                                command = "trustConfirm", params = confirm, ok = "Trust"))
@@ -1616,30 +1744,41 @@ cmd_trust <- function(params, ctx) {
 cmd_trust_confirm <- function(params, ctx) {
   doc <- need_doc(ctx)
   want <- jstring(jget(params, "path")) %||% NA_character_
-  same <- if (is.na(want)) is.na(doc$path) && identical(jstring(jget(params, "name")), doc$name)
-          else !is.na(doc$path) && norm_path(want) == norm_path(doc$path)
-  if (!same) plugin_error("The active workbook changed: run R > Trust This Workbook again.")
-  if (is.na(doc$path)) {
-    trust$session <- unique(c(trust$session, doc$name))
+  want_id <- jstring(jget(params, "id")) %||% NA_character_
+  same <- if (!is.na(want)) {
+    !is.na(doc$path) && norm_path(want) == norm_path(doc$path)
+  } else if (!is.na(want_id) || !is.na(doc$id)) {
+    is.na(doc$path) && identical(want_id, doc$id)
   } else {
+    is.na(doc$path) && identical(jstring(jget(params, "name")), doc$name)
+  }
+  if (!same) plugin_error("The active workbook changed: run R > Trust This Workbook again.")
+  if (!is.na(doc$path)) {
     trust_load()
     trust_save(unique(c(trust$paths, norm_path(doc$path))))
+  } else if (!is.na(doc$id)) {
+    trust$ids[doc$id] <- doc$name %|na|% doc$id
+  } else {
+    trust$session <- unique(c(trust$session, doc$name))
   }
   set_active(doc$path, doc$name)
-  list(message = paste0("R is on for ", doc$name %|na|% "this workbook"),
-       commands = list(list(command = "formulas.calculateNow", params = structure(list(), names = character(0)))))
+  recalculated(list(message = paste0("R is on for ", doc$name %|na|% "this workbook")))
 }
 
 cmd_untrust <- function(params, ctx) {
   doc <- need_doc(ctx)
   label <- doc$name %|na|% "this workbook"
   if (is.na(doc$path)) {
-    if (doc$name %in% trust$session) {
+    if (!is.na(doc$id) && doc$id %in% names(trust$ids)) {
+      trust$ids <- trust$ids[names(trust$ids) != doc$id]
+      return(recalculated_off(list(message = paste0("R is off for ", label))))
+    }
+    if (is.na(doc$id) && doc$name %in% trust$session) {
       trust$session <- setdiff(trust$session, doc$name)
-      return(list(message = paste0("R is off for ", label)))
+      return(recalculated_off(list(message = paste0("R is off for ", label))))
     }
     if (is_new_book(doc$name)) {
-      return(list(message = paste0(label, " is new and unsaved: R stays on until it's saved")))
+      return(list(message = paste0(label, " is new and unsaved: R stays on in a new workbook you write")))
     }
     return(list(message = paste0("R was already off for ", label)))
   }
@@ -1647,25 +1786,32 @@ cmd_untrust <- function(params, ctx) {
   p <- norm_path(doc$path)
   if (!(p %in% trust$paths)) return(list(message = paste0("R was already off for ", label)))
   trust_save(setdiff(trust$paths, p))
-  list(message = paste0("R is off for ", label, " (results already calculated stay until their cells change)"))
+  recalculated_off(list(message = paste0("R is off for ", label)))
+}
+
+# After R was turned off: GridCraft recalculates the R formulas (they show #VALUE!), where it can.
+recalculated_off <- function(out) {
+  if (!invalidate_code()) out$message <- paste0(out$message, " (results already calculated stay until their cells change)")
+  out
 }
 
 trusted_dialog <- function(note = NULL) {
   trust_load()
   paths <- trust$paths
-  if (!length(paths) && !length(trust$session)) {
+  if (!length(paths) && !length(trust$session) && !length(trust$ids)) {
     return(list(message = note %||% "No workbook is trusted",
                 dialog = message_dialog("Trusted Workbooks", paste0(
                   "No workbook is trusted yet. R > Trust This Workbook turns R on for the active workbook.\n\n",
                   "The list is kept in ", trust_file()))))
   }
+  unsaved <- "Unsaved: until GridCraft closes"
   items <- c(lapply(paths, function(p) list(id = p, label = basename(p), detail = dirname(p), icon = "workbook")),
-             lapply(trust$session, function(n) list(id = paste0("session:", n), label = n,
-                                                    detail = "Unsaved: until GridCraft closes", icon = "workbook")))
+             lapply(names(trust$ids), function(i) list(id = paste0("id:", i), label = trust$ids[[i]], detail = unsaved, icon = "workbook")),
+             lapply(trust$session, function(n) list(id = paste0("session:", n), label = n, detail = unsaved, icon = "workbook")))
   out <- list(dialog = list(title = "Trusted Workbooks", kind = "list",
                             prompt = paste("R runs in these workbooks. Select one or more to take them off the list. Kept in", trust_file()),
                             items = items, multi = TRUE, command = "untrustPaths", okLabel = "Remove"),
-              result = list(workbooks = I(paths), session = I(trust$session)))
+              result = list(workbooks = I(paths), session = I(c(unname(trust$ids), trust$session))))
   if (!is.null(note)) out$message <- note
   out
 }
@@ -1674,7 +1820,7 @@ cmd_trusted <- function(params, ctx) {
   if (!has_feature("dialogs")) {
     trust_load()
     return(list(message = sprintf("%d trusted workbook(s)", length(trust$paths)),
-                result = list(workbooks = I(trust$paths), session = I(trust$session), file = trust_file())))
+                result = list(workbooks = I(trust$paths), session = I(c(unname(trust$ids), trust$session)), file = trust_file())))
   }
   trusted_dialog()
 }
@@ -1686,10 +1832,13 @@ cmd_untrust_paths <- function(params, ctx) {
   if (!is.null(one)) ids <- c(ids, one)
   if (!length(ids)) plugin_error("Select the workbooks to take off the list.")
   sess <- sub("^session:", "", ids[startsWith(ids, "session:")])
-  files <- ids[!startsWith(ids, "session:")]
+  sids <- sub("^id:", "", ids[startsWith(ids, "id:")])
+  files <- ids[!startsWith(ids, "session:") & !startsWith(ids, "id:")]
   trust$session <- setdiff(trust$session, sess)
+  trust$ids <- trust$ids[!(names(trust$ids) %in% sids)]
   trust_load()
   if (length(files)) trust_save(setdiff(trust$paths, norm_path(files)))
+  invalidate_code()
   note <- sprintf("Took %d workbook(s) off the list", length(ids))
   if (!has_feature("dialogs")) return(list(message = note))
   trusted_dialog(note)
@@ -1701,7 +1850,7 @@ cmd_about <- function(params, ctx) {
   doc <- context_doc(ctx)
   pkgs <- tryCatch(sort(unique(rownames(utils::installed.packages()))), error = function(e) character(0))
   state <- if (is.null(doc)) "unknown (this GridCraft doesn't say which workbook is open)"
-           else if (doc_trusted(doc$path, doc$name)) paste0("on for ", doc$name %|na|% "this workbook")
+           else if (doc_trusted(doc$path, doc$name, doc$id)) paste0("on for ", doc$name %|na|% "this workbook")
            else paste0("off for ", doc$name %|na|% "this workbook", " (R > Trust This Workbook)")
   if (trust_all()) state <- paste(state, "- GRIDCRAFT_R_TRUST=all trusts every workbook")
   png_ok <- isTRUE(unname(capabilities("png"))) || isTRUE(unname(capabilities("cairo")))
@@ -1716,7 +1865,7 @@ cmd_about <- function(params, ctx) {
     "Trusted workbooks: ", trust_file(), "\n\n",
     length(pkgs), " packages: ", paste(shown_pkgs, collapse = ", "))
   result <- list(plugin = PLUGIN_VERSION, r = R.version.string, rHome = R.home(),
-                 packages = I(pkgs), trusted = !is.null(doc) && doc_trusted(doc$path, doc$name),
+                 packages = I(pkgs), trusted = !is.null(doc) && doc_trusted(doc$path, doc$name, doc$id),
                  trustFile = trust_file())
   if (!has_feature("dialogs")) return(list(message = paste("GridCraft R", PLUGIN_VERSION, "on", R.version.string), result = result))
   list(dialog = message_dialog("About GridCraft R", text), result = result)
@@ -1741,37 +1890,56 @@ run_command <- function(params) {
   ctx <- jget(params, "context")
   if (!is.list(ctx)) ctx <- list()
   doc <- context_doc(ctx)
-  if (!is.null(doc)) set_active(doc$path, doc$name)
+  if (!is.null(doc)) {
+    set_active(doc$path, doc$name)
+    note_doc(doc)
+  }
   p <- jget(params, "params")
   if (!is.list(p)) p <- list()
   json_raw(to_json(cmd(p, ctx)))
 }
 
 # ============================================================================================
-# Events (protocol 1.2): which workbook is active
+# Events (protocol 1.2): which workbook is active; a saved workbook keeps its trust (2.2)
 # ============================================================================================
 
 on_event <- function(event, params) {
-  path <- jstring(jget(params, "path")) %||% NA_character_
-  name <- jstring(jget(params, "name")) %||% (if (is.na(path)) NA_character_ else basename(path))
+  doc <- doc_of(params)
+  path <- doc$path
+  name <- doc$name
   if (event == "documentOpened") {
     set_active(path, name)
-    # GridCraft calculated the workbook before telling us it opened: its R formulas ran as
-    # "unknown workbook" and show #VALUE!. Say how to bring them back.
-    if (!trust_all() && doc_trusted(path, name)) {
+    note_doc(doc)
+    # GridCraft before 2.2 calculated the workbook before telling us it opened, and doesn't say
+    # which workbook a formula is in: its R formulas ran as "unknown workbook". Say how to fix it.
+    if (!has_feature("functionDocument") && !has_feature("openedBeforeCalc") && !trust_all() && doc_trusted(path, name)) {
       return(json_raw(to_json(list(message = paste0("R: ", name, " is trusted; Formulas > Calculate Now (F9) runs its R formulas")))))
     }
     return(json_raw("{}"))
   }
   if (event == "documentSaved") {
+    # The same workbook (session id) under a file: a trusted workbook stays trusted in it.
+    before <- if (!is.na(doc$id) && exists(doc$id, envir = docs, inherits = FALSE)) get(doc$id, envir = docs) else NULL
     was_new <- active$known && is.na(active$path) && is_new_book(active$name)
     set_active(path, name)
-    if (was_new && !doc_trusted(path, name)) {
+    if (!is.null(before)) {
+      was <- doc_trusted(before$path, before$name, doc$id)
+      note_doc(doc)
+      if (was && !is.na(path) && !trust_all() && !doc_trusted(path, name, doc$id)) {
+        trust_load()
+        trust_save(unique(c(trust$paths, norm_path(path))))
+        return(json_raw(to_json(list(message = paste0("R: ", name, " stays trusted (it's the workbook you trusted)")))))
+      }
+      return(json_raw("{}"))
+    }
+    note_doc(doc)
+    if (was_new && !doc_trusted(path, name, doc$id)) {
       return(json_raw(to_json(list(message = paste0("R: ", name, " is saved; R > Trust This Workbook keeps its R formulas working")))))
     }
     return(json_raw("{}"))
   }
   if (event == "documentClosed") {
+    if (!is.na(doc$id) && exists(doc$id, envir = docs, inherits = FALSE)) rm(list = doc$id, envir = docs)
     if (active$known && !is.na(active$path) && !is.na(path) && norm_path(active$path) == norm_path(path)) {
       active$known <- FALSE
       active$path <- NA_character_
@@ -1870,9 +2038,16 @@ main <- function() {
   assign("quit", function(...) stop("quit() is turned off in GridCraft R"), envir = globalenv())
   assign("q", function(...) stop("q() is turned off in GridCraft R"), envir = globalenv())
   con <- file("stdin", open = "r")
+  io$con <- con
   repeat {
-    line <- tryCatch(readLines(con, n = 1L, warn = FALSE, encoding = "UTF-8", skipNul = TRUE),
-                     error = function(e) character(0))
+    line <- if (length(io$queue)) {
+      first <- io$queue[1L]
+      io$queue <- io$queue[-1L]
+      first
+    } else {
+      tryCatch(readLines(con, n = 1L, warn = FALSE, encoding = "UTF-8", skipNul = TRUE),
+               error = function(e) character(0))
+    }
     if (length(line) == 0L) break
     if (!grepl("[^ \t\r]", line, useBytes = TRUE)) next
     if (nchar(line, type = "bytes") > MAX_LINE) {

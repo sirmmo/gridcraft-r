@@ -227,7 +227,7 @@ s <- session(c(
 ))
 cat(sprintf("session 1: %d answers in %.1f s\n", length(s$answers), proc.time()[["elapsed"]] - t0))
 same("initialize", s$answers[["0"]]$result$protocolVersion, 1)
-check("R.VERSION", grepl("^GridCraft R 0.1.0 on R ", value(s, 1)))
+check("R.VERSION", grepl("^GridCraft R 0.2.0 on R ", value(s, 1)))
 same("R.EVAL off before any workbook is known", err_msg(s, 2), "R is turned off for this workbook: R > Trust This Workbook")
 same("R.CALL off too", err_msg(s, 3), "R is turned off for this workbook: R > Trust This Workbook")
 same("unknown function", s$answers[["4"]]$error$code, -32601)
@@ -354,6 +354,95 @@ if (isTRUE(unname(capabilities("png"))) || isTRUE(unname(capabilities("cairo")))
 same("about says on", s$answers[["30"]]$result$result$trusted, TRUE)
 check("result past the last row", grepl("doesn't fit", err_msg(s, 31)))
 check("shutdown stops", is.null(s$answers[["99"]]))
+
+# GridCraft 2.2: trust follows each formula's own workbook; trusting and untrusting recalculate
+# through host/functions/invalidate; blanks; literal text; code fields.
+INIT22 <- req(0, "initialize", paste0("{\"protocolVersion\":1,\"host\":{\"id\":\"gridcraft\",\"version\":\"0.7.0\",\"protocol\":\"2.2\",",
+  "\"features\":[\"dialogs\",\"open\",\"events\",\"document\",\"push\",\"collab\",\"functionDocument\",\"openedBeforeCalc\",",
+  "\"multiline\",\"emptyResult\",\"literalValues\",\"invalidate\"]}}"))
+fdoc <- function(id, name, args, doc) req(id, "functions/call", paste0("{\"name\":\"", name, "\",\"args\":", args, ",\"document\":", doc, "}"))
+answer <- function(rid) paste0("{\"jsonrpc\":\"2.0\",\"id\":\"", rid, "\",\"result\":{\"functions\":[\"R.EVAL\",\"R.CALL\"]}}")
+book2 <- file.path(data_dir, "Model.xlsx")
+invisible(file.create(book2))
+b2 <- g$json_str(normalizePath(book2, winslash = "/"))
+d_model <- paste0("{\"path\":", b2, ",\"name\":\"Model.xlsx\",\"dirty\":false,\"id\":\"doc-7\"}")
+d_book1 <- "{\"path\":null,\"name\":\"Book1\",\"dirty\":false,\"id\":\"doc-1\"}"
+d_sales <- "{\"path\":null,\"name\":\"Sales sample\",\"dirty\":false,\"id\":\"doc-9\"}"
+d_sales2 <- "{\"path\":null,\"name\":\"Sales sample\",\"dirty\":false,\"id\":\"doc-10\"}"
+saved <- file.path(data_dir, "sales.xlsx")
+d_saved <- paste0("{\"path\":", g$json_str(normalizePath(saved, winslash = "/", mustWork = FALSE)), ",\"name\":\"sales.xlsx\",\"dirty\":false,\"id\":\"doc-9\"}")
+s <- session(c(
+  INIT22,
+  cmd(1, "about", "{}", d_book1),                            # the add-in heard of Book1 (trusted)...
+  fdoc(2, "R.EVAL", "[\"1+1\"]", d_model),                    # ...but this formula is in Model.xlsx: off
+  fdoc(3, "R.EVAL", "[\"1+2\"]", d_book1),                    # Book1's own formula: on
+  fcall(4, "R.EVAL", "[\"1+3\"]"),                           # no document: off
+  cmd(5, "trust", "{}", d_model),
+  cmd(6, "trustConfirm", paste0("{\"path\":", b2, ",\"name\":\"Model.xlsx\",\"id\":\"doc-7\"}"), d_model),
+  answer("r1"),
+  fdoc(7, "R.EVAL", "[\"2*3\"]", d_model),
+  cmd(8, "trust", "{}", d_sales),
+  cmd(9, "trustConfirm", "{\"path\":null,\"name\":\"Sales sample\",\"id\":\"doc-9\"}", d_sales),
+  answer("r2"),
+  fdoc(10, "R.EVAL", "[\"10\"]", d_sales),
+  fdoc(11, "R.EVAL", "[\"11\"]", d_sales2),                   # same name, another workbook: off
+  req(12, "events/documentSaved", d_saved),
+  fdoc(13, "R.EVAL", "[\"13\"]", d_saved),                    # saved: the same workbook, still on
+  fdoc(14, "R.EVAL", "[\"NA\"]", d_model),
+  fdoc(15, "R.EVAL", "[\"c(1, NA)\"]", d_model),
+  fdoc(16, "R.EVAL", "[\"NULL\"]", d_model),
+  cmd(17, "runScript", "{\"code\":\"data.frame(d = as.Date(c('2024-01-05', NA)), s = c('=1+1', '007'), n = 1:2)\"}", d_model),
+  cmd(18, "runScript", "{}", d_model),
+  cmd(19, "untrust", "{}", d_model),
+  answer("r3"),
+  fdoc(20, "R.EVAL", "[\"20\"]", d_model),
+  cmd(21, "trusted", "{}", d_book1),
+  cmd(22, "untrustPaths", "{\"ids\":[\"id:doc-9\"]}", d_book1),
+  answer("r4"),
+  fdoc(23, "R.EVAL", "[\"23\"]", d_sales),
+  cmd(24, "untrust", "{}", d_book1),
+  fdoc(25, "R.EVAL", "[\"25\"]", d_book1),
+  fdoc(26, "R.QUANTILE", "[[[1],[2],[3]],0.5]", d_sales2)     # statistics need no trust
+))
+check("2.2: the formula's workbook decides, not the last one heard of", grepl("turned off", err_msg(s, 2)))
+same("2.2: Book1's formula", value(s, 3), 3)
+check("2.2: no document: off", grepl("turned off", err_msg(s, 4)))
+same("2.2: trust asks first, naming the workbook's id", s$answers[["5"]]$result$dialog$params$id, "doc-7")
+same("2.2: trusting invalidates R.EVAL and R.CALL", s$answers[["r1"]]$method, "host/functions/invalidate")
+same("2.2: ...by name", s$answers[["r1"]]$params$names, list("R.EVAL", "R.CALL"))
+same("2.2: trusted", s$answers[["6"]]$result$message, "R is on for Model.xlsx")
+check("2.2: no Calculate Now needed", is.null(s$answers[["6"]]$result$commands))
+same("2.2: on after trusting", value(s, 7), 6)
+same("2.2: an unsaved workbook trusted by id", value(s, 10), 10)
+check("2.2: another workbook with the same name: off", grepl("turned off", err_msg(s, 11)))
+check("2.2: saved, it stays trusted", grepl("stays trusted", s$answers[["12"]]$result$message))
+same("2.2: on in the saved file", value(s, 13), 13)
+check("2.2: the saved file is on the list", normalizePath(saved, winslash = "/", mustWork = FALSE) %in% g$json_parse(paste(readLines(file.path(data_dir, "trusted.json")), collapse = ""))$workbooks)
+same("2.2: NA is a blank", value(s, 14), list(empty = TRUE))
+same("2.2: NA in a column is a blank", value(s, 15), list(list(1), list(list(empty = TRUE))))
+same("2.2: NULL is a blank", value(s, 16), list(empty = TRUE))
+w <- s$answers[["17"]]$result$commands
+same("2.2: text is written literally", w[[1L]]$params$literal, TRUE)
+same("2.2: no apostrophes", w[[1L]]$params$values[[1L]], list("d", "s", "n"))
+same("2.2: formulas and numbers as text stay text", w[[1L]]$params$values[[2L]][2:3], list("=1+1", 1))
+same("2.2: '007' too", w[[1L]]$params$values[[3L]][[2L]], "007")
+same("2.2: dates are written as dates", w[[2L]]$params[c("range", "values")], list(range = "B7", values = list(list("2024-01-05"))))
+check("2.2: ...not literally", is.null(w[[2L]]$params$literal))
+same("2.2: header bold", w[[3L]]$params$range, "B6:D6")
+f <- s$answers[["18"]]$result$dialog
+same("2.2: a code field", f$fields[[1L]][c("multiline", "code")], list(multiline = TRUE, code = TRUE))
+check("2.2: no ';' advice", !grepl("Separate statements", f$prompt))
+same("2.2: untrusting invalidates too", s$answers[["r3"]]$method, "host/functions/invalidate")
+check("2.2: untrusted", grepl("^R is off for Model.xlsx$", s$answers[["19"]]$result$message))
+check("2.2: off after untrust", grepl("turned off", err_msg(s, 20)))
+labels <- vapply(s$answers[["21"]]$result$dialog$items, function(i) i$label, "")
+check("2.2: the list shows the unsaved workbook", "Sales sample" %in% labels)
+same("2.2: removing invalidates", s$answers[["r4"]]$method, "host/functions/invalidate")
+check("2.2: removed by id: off", grepl("turned off", err_msg(s, 23)))
+check("2.2: a new Book1 stays on", grepl("stays on", s$answers[["24"]]$result$message))
+same("2.2: Book1 still on", value(s, 25), 25)
+same("2.2: statistics in any workbook", value(s, 26), 2)
+check("2.2: every line on stdout is JSON", all(vapply(s$lines, function(l) !is.null(tryCatch(P(l), error = function(e) NULL)), NA) | s$lines == ""))
 
 # Old hosts (no dialogs, no document): functions work, R code stays off, commands say why.
 s <- session(c(

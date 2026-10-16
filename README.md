@@ -25,7 +25,10 @@ gridcraft-cli --plugin ~/plugins/io.github.sirmmo.r eval '=R.QUANTILE({1,2,3,4,5
 ```
 
 It needs GridCraft 0.7 or later for the commands, the dialogs and the trust model (older versions
-run the statistics functions only; see [Trust](#trust)).
+run the statistics functions only; see [Trust](#trust)). With a GridCraft that speaks plugin
+protocol 2.2, trust follows each formula's own workbook, the code boxes have several lines, empty
+results are blank and scripts write text as text; on earlier 0.7 versions it works as 0.1.0 did,
+with the limits listed under [Older GridCraft versions](#older-gridcraft-versions).
 
 ### R
 
@@ -93,6 +96,9 @@ formula with `runif()` or `Sys.time()` doesn't change on F9. Errors aren't kept,
 their cause (defining a function in the console, installing a package) **Formulas › Calculate
 Now** runs them again.
 
+**Empty results.** `NA` and `NULL` show as empty cells (with GridCraft before protocol 2.2: as
+empty text, since it would show 0).
+
 **Errors.** An R error shows `#VALUE!` in the cell, and R's message goes to GridCraft's log
 (`R error: object 'z' not found`). So does a syntax error, and code that runs more than 25
 seconds (it's stopped). Output that the code prints (`print`, `cat`, `message`, warnings) goes
@@ -112,8 +118,9 @@ On the **R** tab, and two of them in the cell's right-click menu:
 | **Trusted Workbooks…** (`trusted`) | The list of trusted workbooks; select some and **Remove** them |
 | **About R** (`about`) | The add-in and R versions, `R_HOME`, the libraries, whether PNG plots work, whether R is on for this workbook, the installed packages |
 
-Each command is one undoable step. GridCraft's form fields are single-line: separate statements
-with `;` (`m <- lm(x[,2] ~ x[,1]); coef(m)`), or put a longer script in a file and give its path.
+Each command is one undoable step. The code boxes take several lines (monospace; Tab indents). On
+a GridCraft before protocol 2.2 they're single-line: separate statements with `;`
+(`m <- lm(x[,2] ~ x[,1]); coef(m)`), or put a longer script in a file and give its path.
 
 Agents and scripts run them with `plugins.run`; with `code` in the params no dialog opens:
 
@@ -130,8 +137,8 @@ gridcraft-cli --plugin ~/plugins/io.github.sirmmo.r run --in data.xlsx \
 | `plot` | `{code, header?: bool, width?: 50–4000 (640), height?: 50–4000 (480)}` |
 | `console` | `{code}` → `result.output` |
 | `trust`, `untrust`, `trusted`, `about` | `{}` |
-| `trustConfirm` | `{path, name}` of the active workbook: trusts it without asking (the OK of Trust This Workbook) |
-| `untrustPaths` | `{ids: [path, …]}` |
+| `trustConfirm` | `{path, name, id}` of the active workbook (as `context.document` gives them): trusts it without asking (the OK of Trust This Workbook) |
+| `untrustPaths` | `{ids: [path, "id:<session id>", …]}` |
 
 ## Trust
 
@@ -142,41 +149,55 @@ start programs. Formulas run on every recalculation, and a workbook someone send
 The statistics functions (`R.LM`, `R.QUANTILE`, `R.CORR`, `R.TTEST`, `R.SUMMARY`, `R.VERSION`)
 run no code from the workbook and always work.
 
+**Each formula is checked against its own workbook.** GridCraft tells the add-in which workbook
+every formula belongs to (plugin protocol 2.2: `functions/call`'s `document`), and the add-in runs
+an `R.EVAL` or `R.CALL` only when that workbook is trusted. Which workbook is active, which one you
+opened last or ran a command in doesn't matter: an untrusted workbook's R formulas show `#VALUE!`
+even while a trusted one is open beside it, and when it opens, GridCraft tells the add-in before it
+calculates anything.
+
 - **Trust This Workbook** asks first, then adds the workbook's file (its absolute path) to
   `trusted.json` in the add-in's data folder: `~/.local/share/gridcraft-r` on Linux and BSD
   (`$XDG_DATA_HOME/gridcraft-r` when set), `~/Library/Application Support/gridcraft-r` on macOS,
   `%APPDATA%\gridcraft-r` on Windows. The list survives updates of the add-in and is shared by
-  every GridCraft window. A file moved or renamed must be trusted again.
-- **A new workbook** that was never saved (Book1, Book2…) is trusted while unsaved: you're the
-  one writing its formulas. Once saved, its file is a new workbook to trust (the status bar says
-  so). Other unsaved workbooks (an imported `.ods` or `.xls`, a sample) can be trusted until
-  GridCraft closes.
+  every GridCraft window. GridCraft recalculates the workbook's R formulas at once.
+- **Saving keeps trust.** A trusted workbook saved under a new name (Save As, or a new workbook's
+  first save) is the same workbook: its new file goes on the list too, and the status bar says so.
+  A file moved or renamed outside GridCraft must be trusted again.
+- **A new workbook** that was never saved (Book1, Book2…) is trusted: you're the one writing its
+  formulas. Other workbooks without a file (an imported `.ods` or `.xls`, a sample) can be trusted
+  until GridCraft closes; each is told apart by GridCraft's id for it, not by its name.
+- **Stop Trusting** and removing workbooks in **Trusted Workbooks…** recalculate their R formulas
+  too, so they show `#VALUE!` at once.
 - In an untrusted workbook, `R.EVAL` and `R.CALL` cells show `#VALUE!` and the log says
   `R is turned off for this workbook: R > Trust This Workbook`; the commands offer to trust it.
-  After you trust it, GridCraft recalculates and the cells fill in.
 - `GRIDCRAFT_R_TRUST=all` in the environment trusts every workbook: for scripts and CI that
   evaluate their own workbooks (`gridcraft-cli eval`), never for opening other people's files.
 
-### What it can't see
+### Limits
 
-GridCraft doesn't tell an add-in which workbook a formula is in (`functions/call` carries only the
-function's name and arguments). So the add-in follows the workbook GridCraft last told it about:
-the `document` of the last R command you ran, and the documentOpened, documentSaved and
-documentClosed events. That has limits:
+- The rare formulas GridCraft evaluates outside any workbook (none in normal use) get no workbook,
+  so their R code is off.
+- If the add-in takes more than 10 seconds to answer that a workbook opened (R starting on a very
+  slow disk), GridCraft calculates it anyway; its R formulas show `#VALUE!` until **Calculate Now**
+  (F9). They never run untrusted.
+- A workbook opened by another add-in's command is announced to this one as usual; the per-formula
+  check still applies, so nothing runs in it unless it's trusted.
 
-- **Opening a workbook calculates it before GridCraft says it opened.** Its R formulas are
-  computed while the add-in still believes the previous workbook is active. If that one was
-  trusted, an untrusted workbook's R formulas can run as it opens. **Don't open workbooks you
-  don't trust while a trusted one is open, or start a fresh GridCraft for them.** The other way
-  round, a trusted workbook opened while the add-in knew nothing (just started) shows `#VALUE!`
-  in its R cells until **Calculate Now** (F9); the status bar reminds you.
-- **Switching windows says nothing.** With two workbooks open, the add-in keeps following the one
-  it heard of last until a command or event says otherwise. Running any R command (About R, say)
-  in a workbook tells it which one you're in.
-- When GridCraft has just started and nothing has told the add-in about a workbook yet, R code is
-  off: run **Trust This Workbook** (or any R command) first, even in a new Book1.
-- Results already calculated stay in the cells after **Stop Trusting** until their inputs change
-  or the add-in restarts (GridCraft keeps them; the add-in can't clear them).
+### Older GridCraft versions
+
+A GridCraft 0.7 without plugin protocol 2.2 doesn't say which workbook a formula is in. There, the
+add-in follows the workbook GridCraft last told it about (the `document` of the last R command you
+ran, and the documentOpened, documentSaved and documentClosed events), as 0.1.0 did:
+
+- **Opening a workbook calculates it before GridCraft says it opened**, so its R formulas are
+  computed while the add-in still believes the previous workbook is active. **Don't open workbooks
+  you don't trust while a trusted one is open**, or update GridCraft. A trusted workbook opened
+  while the add-in knew nothing shows `#VALUE!` in its R cells until **Calculate Now** (F9).
+- **Switching windows says nothing**: running any R command (About R, say) in a workbook tells the
+  add-in which one you're in. Just after GridCraft started, R code is off until a command ran.
+- Results already calculated stay in the cells after **Stop Trusting** until their inputs change.
+- A saved new workbook is a new file to trust; unsaved workbooks are told apart by name.
 - GridCraft versions before 0.7 don't say which workbook is open at all: R code stays off, and
   only the statistics functions work.
 
@@ -212,7 +233,7 @@ them into R dates.
 | a list of single values | like a vector |
 | factor | its labels (text) |
 | logical | `TRUE` / `FALSE` |
-| `NA`, `NULL` | an empty cell (empty text in a formula's result: GridCraft would show 0 for a null) |
+| `NA`, `NULL` | an empty cell (blank; before protocol 2.2, empty text in a formula's result, since GridCraft would show 0) |
 | `NaN`, `Inf`, `-Inf` | `#NUM!` |
 | `Date` | ISO text, `2024-01-05` (functions can't return dates; Run Script writes real dates) |
 | `POSIXct`, `POSIXlt` | text, `2024-01-05 14:30:00` (local time) |
@@ -220,13 +241,15 @@ them into R dates.
 
 Text longer than 32,767 characters is cut. A result over 1,000,000 cells is `#NUM!` (functions)
 or an error (commands); so is an argument list over 1,000,000 cells (`#VALUE!`). Run Script
-writes text as text (a leading `=` stays text, not a formula).
+writes text as text: a leading `=` stays text, not a formula, and `007` or `1/2` stay as written
+(protocol 2.2's literal values; before it, text is written with a leading apostrophe).
 
 ## Troubleshooting
 
 - **Every R formula shows `#VALUE!`.** Look at GridCraft's log: `R is turned off for this
-  workbook` means it isn't trusted (or the add-in doesn't know which workbook it's in yet: run
-  **R › Trust This Workbook**); `R error: …` is R's own message.
+  workbook (…)` names the workbook that isn't trusted (on older GridCraft versions the add-in may
+  not know which workbook it's in yet: run **R › Trust This Workbook**); `R error: …` is R's own
+  message.
 - **The add-in doesn't start / is "failed"**: GridCraft can't find `Rscript`. Check that
   `Rscript --version` works in a terminal, then see [R](#r) for `PATH` on macOS and Windows.
   After fixing it, **Activate** the add-in again (or reload it) in Automate › Add-ins.
@@ -249,15 +272,17 @@ GridCraft starts `Rscript --vanilla main.R` the first time one of the add-in's f
 commands is used, or a document event arrives, and keeps that R running for the session. It sends
 JSON-RPC messages, one per line, on standard input; the add-in answers on standard output
 ([docs/plugins.md](https://github.com/storytold/gridcraft/blob/main/docs/plugins.md), protocol
-1.2: dialogs, `context.document`, document events). `main.R` loads `gridcraft_r.R`, which holds
+1.2: dialogs, `context.document`, document events; protocol 2.2, used when `initialize` lists the
+features: `functionDocument`, `openedBeforeCalc`, `multiline`, `emptyResult`, `literalValues`,
+`invalidate`). `main.R` loads `gridcraft_r.R`, which holds
 everything: a vectorised JSON reader (a million cells in seconds) and writer, the conversions,
 the functions, the commands and the trust list. Answers are flushed after each message, and an R
 error in your code, in a message or in the add-in never stops the process.
 
 Tests: `Rscript tests/run.R` (base R: the JSON code, the conversions, and the add-in driven over
 standard input and output as GridCraft does, with the trust flow, malformed messages and a
-million cells), and `GRIDCRAFT_CLI=/path/to/gridcraft-cli sh tests/e2e.sh` (through GridCraft
-itself).
+million cells, as a GridCraft before and after protocol 2.2), and
+`GRIDCRAFT_CLI=/path/to/gridcraft-cli sh tests/e2e.sh` (through GridCraft itself).
 
 ## Licence
 

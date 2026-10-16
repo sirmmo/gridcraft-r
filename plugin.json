@@ -1,7 +1,7 @@
 {
   "id": "io.github.sirmmo.r",
   "name": "GridCraft R",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "R in GridCraft: R code in formulas, ready-made statistics (linear models, t-tests, quantiles, correlations, summaries), R scripts, plots and a console. Needs R 3.4 or later (Rscript on PATH); no packages.",
   "author": "Marco Montanari",
   "homepage": "https://github.com/sirmmo/gridcraft-r",
@@ -123,7 +123,7 @@
       "id": "trustConfirm",
       "label": "Trust This Workbook (confirmed)",
       "description": "Trusts the active workbook without asking (what Trust This Workbook's OK runs)",
-      "params": "{path, name}: the active workbook's, as a check"
+      "params": "{path, name, id}: the active workbook's (context.document), as a check"
     },
     {
       "id": "untrust",
@@ -139,7 +139,7 @@
       "id": "untrustPaths",
       "label": "Remove Trusted Workbooks",
       "description": "Takes workbooks off the trusted list",
-      "params": "{ids: [path, ...]}"
+      "params": "{ids: [path or \"id:<session id>\", ...]}"
     },
     {
       "id": "about",
